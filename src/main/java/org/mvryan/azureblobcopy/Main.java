@@ -114,6 +114,7 @@ public class Main {
                                                                     @NotNull final String accountKey,
                                                                     @NotNull final String containerName) throws MalformedURLException {
         SharedKeyCredential credential = new SharedKeyCredential(accountName, accountKey);
+
         BlobServiceClient blobServiceClient = new BlobServiceClientBuilder()
                 .endpoint(new URL(String.format("https://%s.blob.core.windows.net", accountName)).toString())
                 .credential(credential)
@@ -143,7 +144,11 @@ public class Main {
         long sourceSize = source.getProperties().blobSize();
 
         BlockBlobClient dest = containerClient.getBlockBlobClient(destBlobName);
-        dest.startCopyFromURL(source.getBlobUrl());
+        String sas = "<your-blob-level-sas>";
+        dest.startCopyFromURL(new URL(source.getBlobUrl() + sas));
+
+//        dest.copyFromURL(source.getBlobUrl() );
+//        dest.startCopyFromURL(source.getBlobUrl());
 
         try {
             while (dest.getProperties().copyStatus() == CopyStatusType.PENDING) {
