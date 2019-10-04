@@ -12,12 +12,15 @@ import java.net.MalformedURLException;
 import java.net.URL;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.format.DateTimeFormatter;
 import java.util.Properties;
 
 import com.azure.storage.blob.BlobServiceClient;
 import com.azure.storage.blob.BlobServiceClientBuilder;
 import com.azure.storage.blob.BlockBlobClient;
 import com.azure.storage.blob.ContainerClient;
+import com.azure.storage.blob.models.CopyStatusType;
+import com.azure.storage.common.credentials.SASTokenCredential;
 import com.azure.storage.common.credentials.SharedKeyCredential;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
@@ -27,6 +30,7 @@ import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
 import org.apache.commons.io.IOUtils;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -62,12 +66,16 @@ public class Main {
                 String dest = commandLine.getOptionValue("destination");
                 String accountName;
                 String accountKey;
+                String accountSAS = null;
                 String containerName;
                 if (commandLine.hasOption("config")) {
                     Properties props = new Properties();
                     props.load(new FileInputStream(new File(commandLine.getOptionValue("config"))));
                     accountName = props.getProperty("account-name");
-                    accountKey = props.getProperty("account-key");
+                    accountKey = props.getProperty("account-key", null);
+                    if (null == accountKey) {
+                        accountSAS = props.getProperty("sas", null);
+                    }
                     containerName = props.getProperty("container");
                 }
                 else {
@@ -78,7 +86,7 @@ public class Main {
 
                 LOG.info("Copying {} to {} in account {} and container {}", source, dest, accountName, containerName);
 
-                ContainerClient containerClient = getContainerClient(accountName, accountKey, containerName);
+                ContainerClient containerClient = getContainerClient(accountName, accountKey, accountSAS, containerName);
                 doAzureCopy(source, dest, containerClient);
             }
         }
@@ -92,9 +100,31 @@ public class Main {
     }
 
     private static ContainerClient getContainerClient(@NotNull final String accountName,
-                                                      @NotNull final String accountKey,
+                                                      @Nullable final String accountKey,
+                                                      @Nullable final String accountSAS,
                                                       @NotNull final String containerName) throws MalformedURLException {
+        if (null != accountKey) {
+            return getContainerClientWithAccountKey(accountName, accountKey, containerName);
+        } else {
+            return getContainerClientWithSAS(accountName, accountSAS, containerName);
+        }
+    }
+
+    private static ContainerClient getContainerClientWithAccountKey(@NotNull final String accountName,
+                                                                    @NotNull final String accountKey,
+                                                                    @NotNull final String containerName) throws MalformedURLException {
         SharedKeyCredential credential = new SharedKeyCredential(accountName, accountKey);
+        BlobServiceClient blobServiceClient = new BlobServiceClientBuilder()
+                .endpoint(new URL(String.format("https://%s.blob.core.windows.net", accountName)).toString())
+                .credential(credential)
+                .buildClient();
+        return blobServiceClient.getContainerClient(containerName);
+    }
+
+    private static ContainerClient getContainerClientWithSAS(@NotNull final String accountName,
+                                                             @NotNull final String accountSAS,
+                                                             @NotNull final String containerName) throws MalformedURLException {
+        SASTokenCredential credential = SASTokenCredential.fromSASTokenString(accountSAS);
         BlobServiceClient blobServiceClient = new BlobServiceClientBuilder()
                 .endpoint(new URL(String.format("https://%s.blob.core.windows.net", accountName)).toString())
                 .credential(credential)
@@ -113,15 +143,30 @@ public class Main {
         long sourceSize = source.getProperties().blobSize();
 
         BlockBlobClient dest = containerClient.getBlockBlobClient(destBlobName);
-        dest.copyFromURL(source.getBlobUrl());
+        dest.startCopyFromURL(source.getBlobUrl());
+
+        try {
+            while (dest.getProperties().copyStatus() == CopyStatusType.PENDING) {
+                Thread.sleep(100);
+            }
+        }
+        catch (InterruptedException e) { }
+
+        if (dest.getProperties().copyStatus() != CopyStatusType.SUCCESS) {
+            LOG.error("Copy was not successful");
+            return;
+        }
 
         long destSize = dest.getProperties().blobSize();
         if (sourceSize != destSize) {
             LOG.error("Copy succeeded, but destination size != source size");
             return;
         }
+        LOG.debug("Destination last-modified: {}", dest.getProperties().lastModified().format(DateTimeFormatter.ISO_DATE_TIME));
 
         try {
+            LOG.debug("Verifying the copy");
+
             File srcTemp = File.createTempFile("asbc", "-src");
             File dstTemp = File.createTempFile("asbc", "-dst");
             srcTemp.deleteOnExit();
@@ -140,6 +185,8 @@ public class Main {
                 LOG.error("Source hash:       {}", srcHash);
                 LOG.error("Destination hash:  {}", dstHash);
             }
+
+            LOG.debug("Copy successful!");
         }
         catch (IOException | NoSuchAlgorithmException e) {
             LOG.error(e.getMessage(), e);
